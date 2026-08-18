@@ -1,0 +1,9 @@
+#---------- Create Postgres ---------------#
+
+1. Get into the server by hitting the mentioned command @arch.txt
+2. Then you're in a psql command executor interface 
+3. Write : CREATE DATABASE <DB NAME>;
+4. Hit \l to see the the created db is actually there or not
+5. Then run => psql -h localhost -p 5432 -U ronitroy -d <DB NAME> 
+
+#---------- Create Postgres ---------------#

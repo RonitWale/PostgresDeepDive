@@ -1,0 +1,23 @@
+Connect to localPostgress => psql -h localhost -p 5432 -U ronitroy -d postgres
+
+
+#-----------------------------------------#
+        BASIC ARCHITECTURE BEGINING
+#-----------------------------------------#
+
+The basic architecture of postgresql heavily relies on client/server model. It consists 
+                A server process, which manages the db files, accepst connections to the database from client applications and perform database actions on 
+       behalf of clients, this db server program is called postgres
+
+As a typical client/server architecture postgres sql frontend(client) ans db server can be on different host , then they connect via TCP/IP protocol hence a files
+that is accesible on client machine may not be accesible on db server end
+
+The Postgres server can handle multiple connections concurrently from client. To achieve this it starts ("forks") a new process for each connection, From that point
+the client and the new server process communicate without intervention by the original 8postgres* process.And thus the server starts alive forever and client process comes and go 
+
+
+#-----------------------------------------#
+        BASIC ARCHITECTURE ENDING
+#-----------------------------------------#
+
+
