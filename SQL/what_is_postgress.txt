@@ -1,0 +1,19 @@
+#########################
+
+    WHAT IS POSTGRES
+
+#########################
+
+Of course like other relational databases postgres is also a relational database management system , The relation is a mathematical term 
+for table
+
+Each table is collection of rows , Each row of a table has same set of named column of a specific datatype.
+
+Tables are grouped into databases, and a collection of database managed by a single PostgreSQL server instance called a DB Cluster
+
+
+#########################
+
+    WHAT IS POSTGRES
+
+#########################
