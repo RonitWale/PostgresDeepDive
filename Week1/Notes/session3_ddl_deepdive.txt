@@ -1,0 +1,729 @@
+################################################################################
+#                                                                              #
+#   SESSION 3 — DDL, SCHEMA EVOLUTION, AND KEYS                               #
+#   Week 1, Module 1 — Foundations & Mental Model Shift                       #
+#   PGQL(R): MongoDB -> PostgreSQL Mastery Program                            #
+#                                                                              #
+################################################################################
+
+PURPOSE OF THIS DOCUMENT
+--------------------------------------------------------------------------------
+Session 2 was about what a column IS. This session is about what happens when
+you CHANGE it — on a table that already has rows, while an application is
+connected and writing to it.
+
+That framing matters, because the beginner version of this topic ("here is
+ALTER TABLE syntax") and the production version ("this ALTER TABLE took an
+ACCESS EXCLUSIVE lock and stalled every query in the system for eleven
+minutes") are the same commands with completely different consequences. In
+MongoDB, adding a field is a non-event — documents are independent and
+schemaless. In Postgres, every DDL statement takes a lock, and some rewrite
+the entire table. Knowing WHICH is the whole skill.
+
+
+################################################################################
+# 1. CREATE TABLE — THE FULL ANATOMY                                         #
+################################################################################
+
+--------------------------------------------------------------------------------
+1.1  Column constraints vs table constraints
+--------------------------------------------------------------------------------
+Constraints can be written inline on a column, or separately at table level.
+They are the SAME objects — inline is just sugar the parser expands.
+
+    -- inline (column constraint)
+    CREATE TABLE t (id bigint PRIMARY KEY, email text NOT NULL UNIQUE);
+
+    -- equivalent, written as table constraints
+    CREATE TABLE t (
+        id     bigint,
+        email  text NOT NULL,
+        CONSTRAINT t_pkey       PRIMARY KEY (id),
+        CONSTRAINT t_email_key  UNIQUE (email)
+    );
+
+Use table-level form when the constraint spans MULTIPLE columns (a composite
+primary key, a multi-column unique), or when you want to NAME the constraint
+yourself. Naming matters more than it looks: the constraint name is what
+appears in the error message your application catches, and what you must
+reference in a later ALTER TABLE ... DROP CONSTRAINT. Auto-generated names
+follow the pattern `{table}_{column(s)}_{suffix}` — `_pkey`, `_key` for
+unique, `_fkey` for foreign key, `_check` for check.
+
+NOT NULL is the odd one out: it is stored as a column attribute
+(pg_attribute.attnotnull), not as a row in pg_constraint like the others.
+This is why you cannot name a NOT NULL constraint the way you can a CHECK,
+and why `\d` displays it in the column list rather than the constraint list.
+
+--------------------------------------------------------------------------------
+1.2  DEFAULT — when is it evaluated?
+--------------------------------------------------------------------------------
+A DEFAULT is an EXPRESSION stored in the catalog, evaluated PER ROW at
+INSERT time — not once at table creation.
+
+    created_at timestamptz NOT NULL DEFAULT now()
+
+Every inserted row gets its own now(). But note: `now()` (and its alias
+CURRENT_TIMESTAMP) returns the TRANSACTION start time, not the statement or
+wall-clock time. Insert 10,000 rows in one transaction and every row gets an
+IDENTICAL created_at. That is usually what you want (consistency within a
+transaction), but if you need per-statement or true wall-clock granularity:
+
+    now()                  -> transaction start   (stable within a txn)
+    statement_timestamp()  -> current statement start
+    clock_timestamp()      -> actual wall clock, advances mid-statement
+
+This bites people building event logs inside batch jobs: every event in the
+batch carries the same timestamp, ordering is lost, and the fix is either
+clock_timestamp() or an identity column as the real ordering key.
+
+A DEFAULT is NOT a constraint. It does not prevent an explicit NULL:
+
+    INSERT INTO t (created_at) VALUES (NULL);   -- inserts NULL, not now()
+
+DEFAULT only applies when the column is OMITTED from the INSERT, or when you
+explicitly write DEFAULT. To actually forbid NULL you need NOT NULL — which
+is why the reference schema pairs them: `NOT NULL DEFAULT now()`.
+
+--------------------------------------------------------------------------------
+1.3  What PRIMARY KEY actually is
+--------------------------------------------------------------------------------
+PRIMARY KEY is not a primitive. It is exactly three things at once:
+
+    UNIQUE  +  NOT NULL  +  "this is the table's canonical identity"
+
+The first two are enforced mechanically; the third is metadata (there can be
+only one per table, and it is what a foreign key references by default when
+you write `REFERENCES othertable` without naming a column).
+
+Critically: declaring PRIMARY KEY or UNIQUE AUTOMATICALLY CREATES A B-TREE
+INDEX to enforce it. You do not — and must not — create that index yourself.
+Check with `\d tablename` and you will see it listed under "Indexes".
+
+Declaring a FOREIGN KEY does NOT create any index. See section 4.3 — this
+asymmetry is one of the most common real-world performance bugs in Postgres.
+
+
+################################################################################
+# 2. PRIMARY KEY STRATEGY — THE ACTUAL DECISION                              #
+################################################################################
+
+--------------------------------------------------------------------------------
+2.1  Natural vs surrogate keys
+--------------------------------------------------------------------------------
+A NATURAL key is data that already identifies the row (ISBN, email, country
+code). A SURROGATE key is a meaningless generated value (identity, uuid).
+
+The argument for natural keys: no extra column, no extra index, joins carry
+meaning. The argument against, and the reason surrogates dominate in
+practice: natural keys CHANGE. An email address you swore was immutable gets
+updated; a "permanent" product SKU gets reissued; a country splits. When a
+primary key value changes, every foreign key referencing it must change too
+(this is what ON UPDATE CASCADE exists for) — and any external system that
+stored that ID now points at nothing.
+
+Default to a surrogate primary key, and enforce the natural key as a
+separate UNIQUE constraint. That gives you both: a stable join target AND
+the business rule enforced. That is exactly the shape of the users table
+from Session 2 — identity PK plus UNIQUE on email.
+
+--------------------------------------------------------------------------------
+2.2  serial vs GENERATED ... AS IDENTITY vs uuid — settled
+--------------------------------------------------------------------------------
+Session 2 covered the mechanics (serial is sugar for a sequence + DEFAULT;
+sequences are non-transactional so gaps are normal). The decision matrix:
+
+  GENERATED ALWAYS AS IDENTITY    Default choice for new schemas. SQL
+                                  standard, real catalog metadata, cannot be
+                                  silently overridden (error 428C9). Use
+                                  OVERRIDING SYSTEM VALUE when you genuinely
+                                  must (data migration, restoring a backup).
+
+  GENERATED BY DEFAULT AS IDENTITY  Same, but a supplied value wins silently.
+                                  Use when a migration tool must insert
+                                  explicit IDs. Carries serial's footgun: the
+                                  sequence is NOT advanced by your explicit
+                                  insert, so it will eventually generate a
+                                  value that collides. Fix with setval().
+
+  serial / bigserial              Legacy. You will read it constantly (Pagila
+                                  and Chinook both use it) — recognize it,
+                                  don't write it in new code.
+
+  uuid                            When IDs must be generated OUTSIDE the
+                                  database: client-side to avoid a round
+                                  trip, or across disconnected systems that
+                                  later merge. Pay the index-locality cost
+                                  knowingly; prefer time-ordered UUIDv7 over
+                                  random v4 on write-heavy tables.
+
+  composite natural PK            Legitimate on pure join tables. See 5.2.
+
+RESETTING A SEQUENCE after a bulk load with explicit IDs — the operation
+everyone needs eventually and nobody remembers:
+
+    SELECT setval(
+        pg_get_serial_sequence('sandbox.users', 'id'),
+        (SELECT max(id) FROM sandbox.users)
+    );
+
+`pg_get_serial_sequence` works for identity columns too, despite the name.
+
+
+################################################################################
+# 3. ALTER TABLE — THE PRODUCTION-CRITICAL PART                              #
+################################################################################
+
+This is the section that separates people who have run a migration on a live
+system from people who have not.
+
+--------------------------------------------------------------------------------
+3.1  The mental model: locks and rewrites are two SEPARATE questions
+--------------------------------------------------------------------------------
+For every DDL statement, ask two independent questions:
+
+    Q1. WHAT LOCK does it take, and for how long?
+        -> determines whether other sessions BLOCK
+    Q2. Does it REWRITE the table (and rebuild every index)?
+        -> determines how LONG the lock is held, and how much I/O it costs
+
+A metadata-only change under ACCESS EXCLUSIVE is fine — it takes the
+strongest lock but releases it in microseconds. A full rewrite under ACCESS
+EXCLUSIVE on a 500M-row table is an outage. Same lock, different world.
+
+POSTGRES LOCK LEVELS, weakest to strongest (the four that matter for DDL):
+
+    ACCESS SHARE              taken by SELECT
+    ROW EXCLUSIVE             taken by INSERT/UPDATE/DELETE
+    SHARE UPDATE EXCLUSIVE    VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY,
+                              VALIDATE CONSTRAINT
+                              -> allows reads AND writes. The good one.
+    SHARE ROW EXCLUSIVE       ADD FOREIGN KEY
+                              -> allows reads, blocks writes
+    ACCESS EXCLUSIVE          most ALTER TABLE, DROP, TRUNCATE, REINDEX
+                              -> blocks EVERYTHING including SELECT
+
+THE LOCK QUEUE TRAP — the single most important operational fact here:
+Postgres lock requests are QUEUED IN ORDER. If a long-running SELECT holds
+ACCESS SHARE, and your ALTER TABLE requests ACCESS EXCLUSIVE, the ALTER
+waits — and every query arriving AFTER it queues behind the ALTER, even
+plain SELECTs that would otherwise be perfectly compatible with the running
+one. One slow query plus one instant DDL statement equals a total stall of
+the table. This is how a "metadata-only, instant" migration takes production
+down.
+
+MITIGATION — always set a lock timeout before DDL on a live system:
+
+    SET lock_timeout = '3s';
+    ALTER TABLE ...;    -- fails fast instead of queueing behind a long query
+
+Fail and retry is correct behavior here. Blocking indefinitely is not.
+
+--------------------------------------------------------------------------------
+3.2  ADD COLUMN
+--------------------------------------------------------------------------------
+    ALTER TABLE t ADD COLUMN notes text;
+    -> METADATA ONLY. Instant at any table size. Adds a pg_attribute row.
+
+    ALTER TABLE t ADD COLUMN status text NOT NULL DEFAULT 'active';
+    -> METADATA ONLY since PG11. The default is stored in
+       pg_attribute.attmissingval and synthesized on read for pre-existing
+       rows. Before PG11 this rewrote the ENTIRE table under ACCESS
+       EXCLUSIVE — a genuine outage on a large table, and the origin of the
+       widespread folk rule "never add a column with a default."
+       That rule is OBSOLETE. Know why it existed and that it no longer
+       applies, because you will still hear it repeated.
+
+    ALTER TABLE t ADD COLUMN uid uuid NOT NULL DEFAULT gen_random_uuid();
+    -> FULL REWRITE. The default is VOLATILE — every row needs a DIFFERENT
+       value, so it cannot be stored once as a missing-value. The PG11
+       optimization applies only to non-volatile defaults.
+       Safe pattern: add nullable, backfill in batches, then SET NOT NULL.
+
+--------------------------------------------------------------------------------
+3.3  SET NOT NULL on a column that already has data
+--------------------------------------------------------------------------------
+This is the exercise the Week 1 plan specifically calls out, and the answer
+is more interesting than "it errors."
+
+    ALTER TABLE t ALTER COLUMN email SET NOT NULL;
+
+Naive behavior: takes ACCESS EXCLUSIVE, then FULL TABLE SCAN to verify no
+existing row is NULL. If any row is NULL:
+
+    ERROR:  column "email" of relation "t" contains null values
+    SQLSTATE 23502
+
+So the two-step is forced: fix the data first, then add the constraint. But
+the SCAN is the production problem — it holds ACCESS EXCLUSIVE for its
+entire duration, blocking every read and write on the table.
+
+THE ZERO-DOWNTIME PATTERN (works on PG12+):
+
+    -- Step 1: add an unvalidated CHECK. Instant — takes the strong lock but
+    -- does NOT scan, because NOT VALID means "trust me for existing rows,
+    -- enforce for new ones."
+    ALTER TABLE t ADD CONSTRAINT t_email_nn
+        CHECK (email IS NOT NULL) NOT VALID;
+
+    -- Step 2: validate it. This DOES scan, but under SHARE UPDATE
+    -- EXCLUSIVE — reads AND writes continue normally throughout.
+    ALTER TABLE t VALIDATE CONSTRAINT t_email_nn;
+
+    -- Step 3: now SET NOT NULL is instant. Postgres sees a validated CHECK
+    -- proving no NULLs exist and SKIPS its own scan.
+    ALTER TABLE t ALTER COLUMN email SET NOT NULL;
+
+    -- Step 4: the CHECK is now redundant.
+    ALTER TABLE t DROP CONSTRAINT t_email_nn;
+
+Understand the shape of this, not just the steps: NOT VALID + VALIDATE is a
+GENERAL technique for converting "one long strong-lock operation" into "one
+instant strong-lock operation plus one long weak-lock operation." It applies
+to foreign keys identically (3.5).
+
+--------------------------------------------------------------------------------
+3.4  ALTER COLUMN TYPE
+--------------------------------------------------------------------------------
+Default behavior: FULL TABLE REWRITE plus a REBUILD OF EVERY INDEX on the
+table, all under ACCESS EXCLUSIVE. On a large table this is the most
+expensive routine DDL there is. Budget for it, or avoid it.
+
+But some conversions are BINARY COERCIBLE — the on-disk representation is
+identical, so Postgres changes only the catalog entry:
+
+    varchar(n)  -> text            no rewrite
+    varchar(n)  -> varchar(m), m>n no rewrite  (widening only)
+    text        -> varchar(n)      REWRITE (must verify every value fits)
+    numeric(p,s)-> numeric(p2,s)   no rewrite if p2 > p and s unchanged
+    int         -> bigint          REWRITE (4 bytes to 8 — different width)
+
+Note the asymmetry: WIDENING a constraint is free, NARROWING requires
+verification. And `int -> bigint` on a primary key of a large, hot table is
+the migration that has ruined more weekends than any other — which is a
+concrete argument for choosing `bigint` over `int` for identity columns at
+design time even when 2.1 billion "feels like plenty."
+
+--------------------------------------------------------------------------------
+3.5  ADD FOREIGN KEY
+--------------------------------------------------------------------------------
+    ALTER TABLE books_authors
+        ADD CONSTRAINT ba_book_fkey FOREIGN KEY (book_id) REFERENCES books(id);
+
+Takes SHARE ROW EXCLUSIVE on BOTH tables (reads continue, writes block) and
+scans the referencing table to verify every existing value has a match.
+
+Same NOT VALID pattern applies:
+
+    ALTER TABLE books_authors ADD CONSTRAINT ba_book_fkey
+        FOREIGN KEY (book_id) REFERENCES books(id) NOT VALID;   -- instant
+    ALTER TABLE books_authors VALIDATE CONSTRAINT ba_book_fkey; -- weak lock
+
+A NOT VALID foreign key still fully enforces NEW writes. Only the historical
+backfill check is deferred.
+
+--------------------------------------------------------------------------------
+3.6  RENAME, DROP, and what survives
+--------------------------------------------------------------------------------
+    ALTER TABLE t RENAME COLUMN a TO b;
+    -> metadata only, instant. And VIEWS DO NOT BREAK — Postgres stores view
+       definitions as parsed trees referencing OIDs and attribute numbers,
+       not text, so the view automatically reports the new name. Your
+       APPLICATION code breaks; the database does not.
+
+    ALTER TABLE t DROP COLUMN a;
+    -> metadata only, instant. The column is marked dropped
+       (pg_attribute.attisdropped) and RENAMED to something like
+       `........pg.dropped.3........`. The DATA IS STILL PHYSICALLY THERE in
+       every existing row — space is reclaimed only as rows are rewritten by
+       UPDATE or VACUUM FULL. Dropping a column does not shrink the table.
+
+    DROP TABLE t;                 -- fails if anything depends on t
+    DROP TABLE t CASCADE;         -- drops dependents too
+
+CASCADE takes down: foreign key constraints in OTHER tables that reference
+t, views defined on t, and any dependent sequences owned by t. It does NOT
+take down tables that t references (dependency runs one way). Postgres lists
+exactly what it is about to cascade to — READ THAT OUTPUT. Run it once in
+your sandbox deliberately, as the Week 1 plan asks, precisely so the shape
+of that message is familiar the first time you see it somewhere that matters.
+
+To preview without committing:
+
+    BEGIN;
+      DROP TABLE t CASCADE;   -- read the NOTICE listing dependents
+    ROLLBACK;
+
+--------------------------------------------------------------------------------
+3.7  DDL IS TRANSACTIONAL — the genuinely great Postgres feature
+--------------------------------------------------------------------------------
+    BEGIN;
+      ALTER TABLE t ADD COLUMN x int;
+      ALTER TABLE t ADD CONSTRAINT ... ;
+      CREATE INDEX ...;
+    ROLLBACK;   -- ALL of it undone, atomically
+
+Postgres puts DDL under full MVCC — schema changes are as transactional as
+data changes. Oracle and MySQL (pre-8.0 especially) auto-commit DDL, so a
+migration that fails halfway leaves the schema in an undefined half-applied
+state. In Postgres, a failed migration rolls back cleanly and completely.
+
+This is why migration tools (Flyway, Liquibase, Alembic) can offer real
+all-or-nothing migrations on Postgres. It is a genuine architectural
+advantage and worth being able to articulate.
+
+Exceptions that CANNOT run inside a transaction block:
+    CREATE INDEX CONCURRENTLY
+    DROP INDEX CONCURRENTLY
+    CREATE DATABASE / DROP DATABASE
+    VACUUM
+    ALTER TYPE ... ADD VALUE   (adding to an enum; PG12+ relaxed this
+                                somewhat but restrictions remain)
+
+
+################################################################################
+# 4. FOREIGN KEYS — REFERENTIAL INTEGRITY IN PRACTICE                        #
+################################################################################
+
+--------------------------------------------------------------------------------
+4.1  Referential actions
+--------------------------------------------------------------------------------
+    ON DELETE / ON UPDATE:
+      NO ACTION    (default) raise an error — check deferred to end of stmt
+      RESTRICT     raise an error immediately, cannot be deferred
+      CASCADE      delete/update the referencing rows too
+      SET NULL     set the referencing column to NULL
+      SET DEFAULT  set it to the column's DEFAULT
+
+CHOOSING, honestly:
+
+  CASCADE is right when the child has NO INDEPENDENT EXISTENCE — a join-table
+  row, an order line item, a per-user setting. Deleting the parent SHOULD
+  delete them; leaving them is corruption.
+
+  CASCADE is dangerous when the child is a real entity or a historical
+  record. `ON DELETE CASCADE` from customers to orders means deleting one
+  customer silently erases their entire order history — and the deletion
+  cascades transitively through every further CASCADE it reaches. There is
+  no confirmation and no undo outside a transaction.
+
+  RESTRICT / NO ACTION is the safe default for anything resembling a record.
+  Forcing the application to handle children explicitly is a feature.
+
+  SET NULL requires the column to be nullable, and means "the relationship
+  ended but this row lives on" — an employee whose manager left.
+
+--------------------------------------------------------------------------------
+4.2  DEFERRABLE constraints
+--------------------------------------------------------------------------------
+    ALTER TABLE t ADD CONSTRAINT fk ... DEFERRABLE INITIALLY DEFERRED;
+
+Defers the check to COMMIT rather than statement end. This is what makes
+circular references possible (A references B, B references A — neither can
+be inserted first under immediate checking), and it makes bulk loads in
+arbitrary order tractable. Cost: violations surface at COMMIT, far from the
+statement that caused them, which is harder to debug. Use deliberately.
+
+--------------------------------------------------------------------------------
+4.3  THE MISSING INDEX — the most common FK performance bug
+--------------------------------------------------------------------------------
+PRIMARY KEY and UNIQUE automatically create their backing index.
+FOREIGN KEY DOES NOT.
+
+The referenced (parent) side is always indexed — it must be a PK or UNIQUE.
+The referencing (child) side gets NOTHING unless you create it.
+
+Consequence: every DELETE or key-UPDATE on the parent must verify no child
+rows reference the deleted key. With no index on the child's FK column, that
+verification is a SEQUENTIAL SCAN of the entire child table — per deleted
+row. Delete 1,000 parent rows from a table with a 50M-row child and you have
+issued 1,000 sequential scans of 50M rows, inside one transaction, holding
+locks the whole time. This presents as "our deletes mysteriously take
+hours," and it is almost always this.
+
+    -- ALWAYS pair a foreign key with an index on the referencing column:
+    CREATE INDEX ON books_authors (book_id);
+    CREATE INDEX ON books_authors (author_id);
+
+Find them in any existing database: query pg_constraint for contype = 'f'
+and check whether pg_index has a matching index with that column leading.
+Every mature Postgres shop has a variant of this query in its toolkit.
+
+
+################################################################################
+# 5. THE HANDS-ON SCHEMA — authors / books / books_authors                    #
+################################################################################
+
+--------------------------------------------------------------------------------
+5.1  Why this shape, in Mongo terms
+--------------------------------------------------------------------------------
+In MongoDB you would almost certainly embed: a `book` document with an
+`authors: [...]` array. That works, and for read-heavy single-book access it
+is faster — one document fetch, no join.
+
+What it costs you, and what the relational form buys:
+
+  - An author is a REAL ENTITY with its own attributes (bio, birth date,
+    nationality). Embedded in an array, that data is duplicated across every
+    book they wrote. Updating an author's name means touching N documents.
+  - "Which authors have written more than 3 books" is a $unwind + $group
+    pipeline in Mongo. It is a two-line GROUP BY here.
+  - Nothing in Mongo stops you inserting a book whose author array references
+    an author that does not exist. A foreign key makes that literally
+    impossible.
+
+The join table IS the relationship, modeled as a first-class thing. That is
+the mental shift the whole of Module 1 is aimed at.
+
+--------------------------------------------------------------------------------
+5.2  The reference schema
+--------------------------------------------------------------------------------
+    CREATE TABLE sandbox.authors (
+        id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        full_name   text        NOT NULL,
+        born_on     date,
+        created_at  timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE sandbox.books (
+        id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        title           text        NOT NULL,
+        isbn            text        UNIQUE,          -- natural key, NOT the PK
+        published_on    date,
+        price           numeric(10,2) CHECK (price >= 0),
+        created_at      timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE sandbox.books_authors (
+        book_id     bigint NOT NULL
+                    REFERENCES sandbox.books(id)   ON DELETE CASCADE,
+        author_id   bigint NOT NULL
+                    REFERENCES sandbox.authors(id) ON DELETE CASCADE,
+        author_order smallint,                      -- 1st author, 2nd author
+        PRIMARY KEY (book_id, author_id)
+    );
+
+    -- REQUIRED companion index: see 4.3 and 5.4
+    CREATE INDEX ON sandbox.books_authors (author_id);
+
+DECISIONS WORTH DEFENDING:
+
+  isbn UNIQUE, not PRIMARY KEY   The natural key is enforced but not used as
+                                 the join target. ISBNs get reissued, and
+                                 books predating ISBN have none — note it is
+                                 nullable, and UNIQUE permits MULTIPLE NULLs
+                                 in Postgres (NULL is never equal to NULL).
+
+  composite PK on the join table This is the case where a natural composite
+                                 key is genuinely right. The pair IS the
+                                 identity; a surrogate id would add a column
+                                 and an index while still needing a UNIQUE
+                                 on the pair to prevent duplicates. Add a
+                                 surrogate here only if something else must
+                                 foreign-key TO the relationship itself.
+
+  ON DELETE CASCADE on both      Correct here: a books_authors row has no
+                                 independent meaning. Delete the book and the
+                                 association is meaningless, not orphaned.
+
+  CHECK (price >= 0)             Cheap, and catches a whole class of bug at
+                                 the boundary. Constraints are documentation
+                                 the database enforces.
+
+--------------------------------------------------------------------------------
+5.3  The ALTER TABLE exercise, done properly
+--------------------------------------------------------------------------------
+Do these IN ORDER on the schema above, after inserting a few rows including
+at least one author with a NULL value in the column you are about to
+constrain — the point is to hit the failure, not avoid it.
+
+    -- (a) add a column: instant, metadata only
+    ALTER TABLE sandbox.authors ADD COLUMN country_code text;
+
+    -- (b) add a column WITH a non-volatile default: also instant on PG11+
+    ALTER TABLE sandbox.authors
+        ADD COLUMN is_active boolean NOT NULL DEFAULT true;
+
+    -- (c) now the interesting one — SET NOT NULL with a NULL present
+    ALTER TABLE sandbox.authors ALTER COLUMN country_code SET NOT NULL;
+    -- ERROR: column "country_code" of relation "authors" contains null values
+    -- SQLSTATE 23502.  Fix the data, then retry:
+    UPDATE sandbox.authors SET country_code = 'XX' WHERE country_code IS NULL;
+    ALTER TABLE sandbox.authors ALTER COLUMN country_code SET NOT NULL;
+
+    -- (d) redo (c) using the zero-downtime pattern from 3.3 and compare
+    --     which locks each step takes
+
+    -- (e) a no-rewrite type change vs a rewriting one — observe the
+    --     difference in duration on a table with some rows
+    ALTER TABLE sandbox.books ALTER COLUMN isbn TYPE text;        -- free
+    ALTER TABLE sandbox.books ALTER COLUMN isbn TYPE varchar(20); -- rewrite
+
+    -- (f) CASCADE: preview first, then commit
+    BEGIN;
+      DROP TABLE sandbox.books CASCADE;   -- READ the NOTICE
+    ROLLBACK;
+
+WATCH THE LOCKS while you do it. In a SECOND psql session:
+
+    SELECT pid, relation::regclass, mode, granted
+    FROM pg_locks
+    WHERE relation::regclass::text LIKE '%books%';
+
+This is the single most valuable habit in this session. Seeing
+`AccessExclusiveLock` appear and disappear makes every abstract warning in
+section 3 concrete.
+
+--------------------------------------------------------------------------------
+5.4  Composite index column ORDER — the leading-column rule
+--------------------------------------------------------------------------------
+`PRIMARY KEY (book_id, author_id)` creates ONE B-tree index on that pair, in
+that order. A B-tree can only be used efficiently when the query constrains
+a LEFTMOST PREFIX of its columns:
+
+    WHERE book_id = 5                        -> uses the index
+    WHERE book_id = 5 AND author_id = 9      -> uses the index
+    WHERE author_id = 9                      -> CANNOT use it efficiently
+
+So "give me all authors of this book" is fast, and "give me all books by
+this author" is a sequential scan — until you add the second index. That is
+the same index section 4.3 demands for the foreign key, which is why one
+`CREATE INDEX ON books_authors (author_id)` satisfies both requirements at
+once. This is not a coincidence; it is the general shape of join-table
+indexing.
+
+(Full treatment of multi-column ordering, partial and covering indexes is
+Week 8. What you need now: composite index order is not arbitrary, and the
+leftmost-prefix rule is why.)
+
+
+################################################################################
+# 6. SELF-CHECK                                                              #
+################################################################################
+
+  1. `ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 0;` on a 200M-row
+     table. Instant or an outage? Now answer for
+     `DEFAULT gen_random_uuid()`. Explain the difference in one sentence.
+
+  2. Your DDL statement is "metadata only, microseconds." Explain how it can
+     still stall every query against that table for ten minutes.
+
+  3. Why does adding a FOREIGN KEY not create an index, and what specific
+     symptom appears in production when you forget to add one yourself?
+
+  4. Walk through NOT VALID + VALIDATE CONSTRAINT. What is the actual
+     trade being made, in terms of lock strength and duration?
+
+  5. You `DROP COLUMN` a 4GB text column. Does the table get smaller? Why?
+
+  6. When is a composite natural primary key the RIGHT choice, and what
+     question decides it?
+
+  7. `PRIMARY KEY (a, b)` exists. A query filters on `b` alone and is slow.
+     Explain why, and give two different fixes.
+
+
+################################################################################
+# 7. CHEAT SHEET — SESSION 3 IN ONE PAGE                                     #
+################################################################################
+
+--------------------------------------------------------------------------------
+LOCK LEVELS (weakest -> strongest)
+--------------------------------------------------------------------------------
+  ACCESS SHARE ............ SELECT
+  ROW EXCLUSIVE ........... INSERT / UPDATE / DELETE
+  SHARE UPDATE EXCLUSIVE .. VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY,
+                            VALIDATE CONSTRAINT      <- reads + writes OK
+  SHARE ROW EXCLUSIVE ..... ADD FOREIGN KEY          <- reads OK, writes block
+  ACCESS EXCLUSIVE ........ most ALTER TABLE, DROP, TRUNCATE  <- blocks ALL
+
+  LOCK QUEUE: requests are served IN ORDER. A blocked ALTER blocks every
+  query queued behind it. ALWAYS: SET lock_timeout = '3s'; before DDL.
+
+--------------------------------------------------------------------------------
+DOES IT REWRITE THE TABLE?
+--------------------------------------------------------------------------------
+  ADD COLUMN (no default) ................... NO  instant
+  ADD COLUMN + constant DEFAULT ............. NO  instant (PG11+)
+  ADD COLUMN + VOLATILE default ............. YES full rewrite
+  DROP COLUMN ............................... NO  instant, space NOT reclaimed
+  RENAME COLUMN / TABLE ..................... NO  instant, views survive
+  SET NOT NULL .............................. no rewrite, but FULL SCAN
+  varchar(n) -> text ........................ NO  binary coercible
+  varchar(n) -> varchar(m), m > n ........... NO  widening is free
+  text -> varchar(n) ........................ YES must verify every value
+  int -> bigint ............................. YES different width. Use bigint
+                                                  from day one.
+
+--------------------------------------------------------------------------------
+THE NOT VALID PATTERN (memorize this shape)
+--------------------------------------------------------------------------------
+  ADD CONSTRAINT ... NOT VALID     -> instant, strong lock, no scan
+  VALIDATE CONSTRAINT ...          -> scans, but WEAK lock (reads+writes OK)
+
+  Converts one long strong-lock op into one instant strong-lock op plus one
+  long weak-lock op. Works for CHECK and FOREIGN KEY. The SET NOT NULL
+  version: add CHECK (col IS NOT NULL) NOT VALID -> VALIDATE -> SET NOT NULL
+  (now instant, PG12+) -> DROP the CHECK.
+
+--------------------------------------------------------------------------------
+INDEXES: WHAT IS AUTOMATIC AND WHAT IS NOT
+--------------------------------------------------------------------------------
+  PRIMARY KEY ..... index created automatically
+  UNIQUE .......... index created automatically
+  FOREIGN KEY ..... NOTHING. You must create it yourself.
+                    Forgetting = seq scan of the child table per parent
+                    delete. Symptom: "deletes take hours."
+
+  Composite index (a, b) serves: WHERE a  /  WHERE a AND b
+                    does NOT serve: WHERE b      (leftmost-prefix rule)
+
+--------------------------------------------------------------------------------
+KEY FACTS
+--------------------------------------------------------------------------------
+  PRIMARY KEY   = UNIQUE + NOT NULL + canonical identity (+ auto index)
+  UNIQUE        allows MULTIPLE NULLs (NULL never equals NULL)
+  DEFAULT       is an expression evaluated PER ROW at INSERT; does NOT
+                block an explicit NULL — pair it with NOT NULL
+  now()         = TRANSACTION start time. Same value for every row in a
+                  batch. Use clock_timestamp() for true wall clock.
+  NOT NULL      lives in pg_attribute, not pg_constraint — cannot be named
+  DDL IS TRANSACTIONAL in Postgres. BEGIN; ALTER...; ROLLBACK; works.
+                Exceptions: CREATE INDEX CONCURRENTLY, CREATE DATABASE,
+                VACUUM.
+  DROP COLUMN   does not reclaim space until rows are rewritten
+  Surrogate PK + UNIQUE on the natural key = the default pattern
+  Composite natural PK is right on pure join tables
+
+--------------------------------------------------------------------------------
+FK REFERENTIAL ACTIONS
+--------------------------------------------------------------------------------
+  CASCADE     child has no independent existence (join rows, line items)
+  RESTRICT /  child is a real entity or a historical record — the SAFE
+  NO ACTION   default for anything you would be sorry to lose silently
+  SET NULL    relationship ended, row survives (employee's manager left)
+
+--------------------------------------------------------------------------------
+COMMANDS TO KEEP AT HAND
+--------------------------------------------------------------------------------
+  SET lock_timeout = '3s';              before ANY DDL on a live table
+  BEGIN; DROP ... CASCADE; ROLLBACK;    preview what cascades, safely
+  SELECT pid, relation::regclass, mode, granted FROM pg_locks ...
+                                        watch locks from a second session
+  SELECT setval(pg_get_serial_sequence('t','id'), (SELECT max(id) FROM t));
+                                        resync a sequence after a bulk load
+  \d+ tablename                         constraints, indexes, storage, stats
+
+--------------------------------------------------------------------------------
+ONE-LINE TAKEAWAY
+--------------------------------------------------------------------------------
+  Every DDL statement is two questions, never one: what LOCK does it take,
+  and does it REWRITE? A metadata-only change under the strongest lock is
+  harmless; a rewrite under the same lock is an outage.
+
+
+--------------------------------------------------------------------------------
+NEXT: Session 4 — Milestone. Map the Pagila schema by hand using only \d,
+write 10 plain-English questions of the data, and draft your own
+Mongo->Postgres bridge notes. Then the Week 1 self-check.
+--------------------------------------------------------------------------------

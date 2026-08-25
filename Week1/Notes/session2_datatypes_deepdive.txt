@@ -1,0 +1,721 @@
+################################################################################
+#                                                                              #
+#   SESSION 2 — POSTGRESQL DATA TYPES: A DEEP DIVE                            #
+#   Week 1, Module 1 — Foundations & Mental Model Shift                       #
+#   PGQL(R): MongoDB -> PostgreSQL Mastery Program                            #
+#                                                                              #
+################################################################################
+
+PURPOSE OF THIS DOCUMENT
+--------------------------------------------------------------------------------
+This is not a syntax cheat sheet. It goes to internal storage representation,
+performance characteristics, and production failure modes for each type
+family, because that is the level at which type choice actually gets
+interrogated in design review and in interviews. Every section ends with a
+worked example and a "why this bites people in production" note.
+
+
+################################################################################
+# 0. THE PHILOSOPHY: WHY POSTGRES TYPES AREN'T JUST LABELS                   #
+################################################################################
+
+In BSON/MongoDB, a type is a runtime tag attached to a value. In Postgres, a
+type is a first-class catalog object (look in pg_type) with a fixed storage
+length or a variable-length "varlena" header, an input/output function pair,
+an alignment requirement, and (for indexable types) an operator class. This
+is why Postgres can do things BSON fundamentally can't: enforce a column's
+type at every write, let the planner reason about value distributions via
+per-column statistics (pg_stats), and let you define your own types with
+CREATE TYPE that participate in indexing and constraints exactly like
+built-ins.
+
+The practical consequence: a "wrong" type choice in Postgres is not just
+stylistic. It changes row size, index size, write amplification, and what
+the query planner can prove about your data. That is the lens for
+everything below.
+
+
+################################################################################
+# 1. NUMERIC TYPES                                                           #
+################################################################################
+
+--------------------------------------------------------------------------------
+1.1  smallint / integer / bigint
+--------------------------------------------------------------------------------
+Fixed-width, exact binary integers:
+
+    smallint   2 bytes    -32,768 to 32,767
+    integer    4 bytes    -2,147,483,648 to 2,147,483,647
+    bigint     8 bytes    -9,223,372,036,854,775,808 to 9.2 quintillion-ish
+
+Overflow behavior differs from what you may expect coming from languages
+that silently wrap: Postgres raises an error ("integer out of range") rather
+than wrapping. This is a feature — a silent wraparound on a primary key
+sequence is a much worse bug than a loud failure.
+
+Row-size implication: Postgres aligns fixed-width columns to their own size
+(4-byte int aligns to a 4-byte boundary, 8-byte bigint to 8 bytes). Column
+ORDER in a CREATE TABLE therefore affects padding/row size — putting a
+smallint after a bigint can waste bytes to alignment padding that reordering
+would avoid. Rarely matters until you're at the row-count scale where every
+byte times a billion rows is real money.
+
+--------------------------------------------------------------------------------
+1.2  serial / bigserial vs GENERATED ALWAYS AS IDENTITY
+--------------------------------------------------------------------------------
+`serial` is NOT a real type — it's parser sugar. `id serial` expands to:
+
+    CREATE SEQUENCE tablename_id_seq;
+    id integer NOT NULL DEFAULT nextval('tablename_id_seq');
+    ALTER SEQUENCE tablename_id_seq OWNED BY tablename.id;
+
+Because it's just a default expression pulling from a sequence object, two
+consequences follow that surprise people:
+
+  1. GAPS ARE NORMAL. A sequence is deliberately NOT transactional — if it
+     were, concurrent inserts would block each other waiting to see whose
+     transaction commits first to know the "next" value, which would kill
+     concurrency. So nextval() is granted immediately and never rolled back,
+     even if the INSERT that consumed it is. A rolled-back transaction or a
+     crashed connection leaves a permanent gap. If a stakeholder asks "why
+     did we skip from id 4001 to id 4005," this is why — and it is not a
+     bug to fix.
+
+  2. `serial` grants INSERT/UPDATE privilege on the underlying sequence to
+     whoever owns table INSERT rights, in a way that's easy to get wrong
+     when you set up read replicas or logical replication, because the
+     sequence and the table are technically separate objects with separate
+     grant/ownership semantics.
+
+`GENERATED ALWAYS AS IDENTITY` (SQL-standard, added in PG10, now the
+community-recommended default over serial) does the same sequence-backed
+thing but as genuine schema metadata rather than a default-expression trick:
+it shows up correctly in \d, it can't be silently overridden by a plain
+INSERT (you need `OVERRIDING SYSTEM VALUE` to force a value in), and it
+plays more predictably with tools that introspect the catalog. Prefer it for
+new schemas; you'll see plenty of `serial` in the wild in older codebases
+and in Pagila/Chinook themselves, so recognize both.
+
+UUID primary keys are the other option — covered in section 4, since the
+real trade-off there is about index locality, not about SQL syntax.
+
+--------------------------------------------------------------------------------
+1.3  numeric(precision, scale) vs real / double precision
+--------------------------------------------------------------------------------
+This is the single highest-stakes type decision in the whole system for
+anyone building anything that touches money.
+
+`real` (4 bytes) and `double precision` (8 bytes) are IEEE-754 binary
+floating point. They store an approximation of most decimal fractions,
+because most decimal fractions (0.1, 19.99, 0.3) have no exact finite binary
+representation — the same reason `0.1 + 0.2 !== 0.3` in JavaScript.
+
+`numeric(p,s)` — also called `decimal` — stores an exact base-10 value
+internally as a variable-length sequence of base-10000 "digit groups" plus a
+sign, weight, and scale. There is no approximation. Arithmetic on numeric is
+exact but meaningfully slower than native float math, because it isn't a
+single CPU instruction — it's arbitrary-precision decimal arithmetic done in
+software.
+
+    -- demonstrate the failure mode directly:
+    SELECT 19.99::double precision * 3;
+    -- 59.96999999999999 or similar drift, depending on the exact path
+    -- (varies by platform/optimizer; the point is it is NOT guaranteed exact)
+
+    SELECT 19.99::numeric * 3;
+    -- 59.97, exactly, every time, on every platform
+
+RULE: any column representing currency, or any value that will be summed
+and compared for exact equality (balances, ledger entries, tax
+calculations), is `numeric`. Reserve `real`/`double precision` for
+scientific/statistical data where you want speed and can tolerate epsilon
+error — e.g., sensor readings, ML feature vectors, geospatial coordinates
+before they get validated by a proper GIS type.
+
+There is also a `money` type. Skip it in real schemas — it's
+locale-dependent on output formatting (depends on the `lc_monetary` setting
+of whoever's session is reading it), which makes it a portability trap.
+`numeric(12,2)` (or whatever precision your currency needs) plus an explicit
+currency-code column is the pattern actually used in production financial
+schemas.
+
+--------------------------------------------------------------------------------
+WHY THIS BITES PEOPLE IN PRODUCTION
+--------------------------------------------------------------------------------
+A junior engineer picks `double precision` for `account_balance` because it
+"looks like a decimal number." Balances drift by fractions of a cent under
+heavy aggregation. Nobody notices until a reconciliation job flags a
+mismatch between the sum of all ledger entries and the reported total —
+and now it's a finance incident, not a code review comment.
+
+
+################################################################################
+# 2. TEXT TYPES                                                              #
+################################################################################
+
+--------------------------------------------------------------------------------
+2.1  char(n) / varchar(n) / text — one storage format, three faces
+--------------------------------------------------------------------------------
+All three are backed by the SAME internal representation: a "varlena"
+(variable-length attribute) — a 1-or-4-byte length header followed by the
+UTF-8 (or whatever your database encoding is) bytes. There is no separate
+optimized fixed-width storage for char(n)/varchar(n) the way there is in,
+say, MySQL. This means:
+
+  - `text` and `varchar(n)` have IDENTICAL read/write performance. The only
+    difference is `varchar(n)` adds a length CHECK at write time.
+  - `char(n)` additionally right-pads the value with spaces to exactly n
+    characters on storage, and by SQL-standard convention trailing spaces
+    are stripped from the DISPLAYED value on comparison in some contexts —
+    a frequent source of "why doesn't my WHERE clause match" confusion.
+    There is essentially no good reason to use char(n) in a modern schema;
+    it exists for SQL-standard compliance and legacy compatibility.
+
+The Postgres-idiomatic default is: use `text` everywhere, and only add a
+`varchar(n)` — or better, a `CHECK (length(col) <= n)` constraint on a
+`text` column — when the length cap is an actual business rule you want the
+database to enforce (e.g., "usernames are max 30 chars"), not because you
+think it's faster or smaller. It is neither.
+
+--------------------------------------------------------------------------------
+2.2  TOAST — what actually happens to a long text value
+--------------------------------------------------------------------------------
+Postgres pages are 8KB by default, and a row can't span pages. So when a
+varlena value (text, jsonb, bytea, arrays...) gets large — the threshold is
+governed by TOAST_TUPLE_THRESHOLD, effectively around 2KB by default —
+Postgres transparently:
+
+  1. Tries compressing it in place (PGLZ or, on newer versions, LZ4 if
+     configured).
+  2. If still too large, moves it OUT of the main table into a separate,
+     automatically managed TOAST table, leaving just a pointer in the row.
+
+This is why you can store a 500KB JSONB blob in a column without blowing up
+your main table's row density — but it also means a query that touches that
+column pays an extra I/O to detoast it, which matters when you're scanning
+many rows and only need a small field from most of them (a reason to keep
+"hot," frequently-scanned columns narrow and push large blobs to their own
+table or a JSONB column you rarely SELECT * on).
+
+--------------------------------------------------------------------------------
+2.3  Collation and comparison cost
+--------------------------------------------------------------------------------
+Text comparison and sorting go through a collation (locale rules for "what
+order do characters sort in, is 'a' == 'A'"). The default collation on most
+installs is locale-aware (e.g., en_US.UTF-8), which is measurably slower for
+sorting/indexing than the "C" collation (raw byte comparison), because
+locale-aware comparison calls out to libc/ICU per comparison instead of a
+memcmp. For columns that are pure identifiers (codes, slugs, external IDs)
+rather than human-sortable text, an explicit `COLLATE "C"` on the column or
+index can be a real, measurable win on large tables. For genuinely
+human-facing text you want proper locale sorting, this trade-off reverses.
+
+Also worth knowing: case-insensitive matching (`ILIKE`, or comparing
+lowercased values) doesn't use a plain B-tree index efficiently unless you
+either index `lower(col)` (an expression index) or use the `citext`
+extension, which stores text but compares case-insensitively at the type
+level.
+
+
+################################################################################
+# 3. BOOLEAN                                                                 #
+################################################################################
+
+1 byte on disk. Three-valued logic: true / false / NULL — NOT two-valued,
+which matters the moment you write `WHERE is_active = true` and it silently
+excludes NULL rows (NULL is neither true nor equal to true — see the NULL
+three-valued-logic material coming in Week 2).
+
+Practical note: a boolean column is usually low-cardinality (two real
+values), so a plain B-tree index on it is rarely useful for the planner —
+it'll seq-scan anyway once selectivity is above ~a few percent. A PARTIAL
+index (`CREATE INDEX ON t (id) WHERE is_active = true`) is the idiomatic
+Postgres pattern when you specifically need fast lookups of "just the active
+ones" — it indexes only the rows matching the predicate, which is smaller
+and more useful than indexing the whole low-cardinality boolean column.
+
+
+################################################################################
+# 4. DATE / TIME TYPES                                                       #
+################################################################################
+
+--------------------------------------------------------------------------------
+4.1  What's actually stored: timestamp vs timestamptz
+--------------------------------------------------------------------------------
+Both `timestamp` and `timestamptz` are stored identically on disk: an
+8-byte integer counting microseconds since the Postgres epoch
+(2000-01-01 00:00:00). Neither one stores a timezone name or offset per row
+— that's a common misconception from the "tz" in the name.
+
+The difference is entirely in INPUT and OUTPUT conversion:
+
+  - `timestamp` (a.k.a. "timestamp without time zone") takes the literal
+    clock value you give it and stores it as-is — no conversion. It has no
+    idea what timezone that clock value was in. Read it back and you get
+    exactly what you put in, always, regardless of session settings.
+
+  - `timestamptz` converts the input to UTC at write time, using the
+    session's `TimeZone` GUC setting to interpret what timezone the input
+    literal was meant to be in (or uses the explicit offset if you gave
+    one, e.g. `2026-08-25 14:00+05:30`). On read, it converts FROM UTC back
+    to whatever the reading session's `TimeZone` setting currently is. So
+    the same underlying instant displays as "14:00 IST" to one client and
+    "08:30 UTC" to another, correctly — that conversion is what you want
+    99% of the time for anything representing a real-world event.
+
+THE GOTCHA: if you use plain `timestamp` for something like `created_at`,
+and your application servers, cron jobs, and analyst laptops aren't all
+pinned to the exact same timezone setting, the same column now holds values
+whose "real" meaning is ambiguous — a row timestamped 14:00 could be 14:00
+IST from one service and 14:00 UTC from another, and Postgres has no way to
+tell them apart or reconcile them, because it never stored a timezone in
+the first place. This is a real, recurring class of production bug —
+default to `timestamptz` for anything event-like unless you have a specific
+reason to want naive local time (e.g., "this recurring meeting is always at
+9am in whatever timezone the office happens to be in that year," which is
+one of the rare legitimate cases for plain `timestamp` or even just
+`time`).
+
+--------------------------------------------------------------------------------
+4.2  date, time, and interval
+--------------------------------------------------------------------------------
+`date` — 4 bytes, calendar date only, no time component.
+`time` / `time with time zone` — time of day; `time with time zone` exists
+for SQL-standard compliance but is widely considered a design mistake even
+by the Postgres docs themselves (it doesn't know what DATE it applies to,
+so DST-aware conversion is impossible) — avoid it.
+
+`interval` — stores a span, internally as three separate fields: months,
+days, and microseconds — NOT collapsed into a single duration. This is
+deliberate and DST/calendar-aware: adding `interval '1 month'` to
+2026-01-31 correctly lands on 2026-02-28 (or 29 in a leap year) rather than
+erroring or overflowing into March, because "1 month" is evaluated as a
+calendar operation, not a fixed number of seconds.
+
+    SELECT date '2026-01-31' + interval '1 month';
+    -- 2026-02-28 00:00:00
+
+--------------------------------------------------------------------------------
+WHY THIS BITES PEOPLE IN PRODUCTION
+--------------------------------------------------------------------------------
+"Reports are off by exactly 5.5 hours for our India office but correct for
+US users" is close to the most common Postgres timezone bug signature there
+is, and it's almost always a `timestamp` column that should have been
+`timestamptz`, combined with an application layer that assumed the database
+was timezone-aware when it wasn't.
+
+
+################################################################################
+# 5. UUID                                                                    #
+################################################################################
+
+Fixed 16-byte value. Postgres has a built-in `gen_random_uuid()` function
+(core since PG13; before that via the pgcrypto/uuid-ossp extensions) that
+generates version-4 (random) UUIDs.
+
+The real trade-off vs a sequential bigint primary key is about INDEX
+LOCALITY, not about the 16-vs-8-byte storage difference (which matters, but
+is the smaller effect):
+
+  - A sequential bigint/identity column always inserts at the "right edge"
+    of its B-tree index — new rows append, existing index pages stay
+    settled, and the working set of "hot" index pages the buffer cache
+    needs to keep around is small.
+  - A random UUIDv4 primary key inserts at effectively random positions
+    across the entire index every time, because the value has no relation
+    to insertion order. On a large table this means every insert has a
+    real chance of touching a "cold" index page not currently in cache,
+    which increases I/O, causes more index page splits, and leads to more
+    fragmentation/bloat over time than a sequential key would.
+
+The mitigation that's become standard practice: UUIDv7 (time-ordered UUIDs
+— the high bits encode a timestamp, the rest is random), which gets you
+UUID's coordination-free-generation benefit while keeping insert locality
+close to what a sequential integer gives you. Native `uuidv7()` generation
+lands in newer Postgres versions; on older versions it's done via extension
+or application-side generation. Worth knowing the name and the trade-off it
+solves even if you don't need it for a learning-environment table.
+
+WHEN TO ACTUALLY REACH FOR UUID: primary keys that need to be generated
+client-side or across multiple independent systems before ever touching the
+database (avoiding a round-trip to get an ID, or merging data from
+disconnected systems without collision) — a genuine distributed-systems
+need, not a default "UUIDs are more modern" choice.
+
+
+################################################################################
+# 6. JSONB                                                                   #
+################################################################################
+
+--------------------------------------------------------------------------------
+6.1  json vs jsonb — not the same type with different names
+--------------------------------------------------------------------------------
+`json` stores the EXACT input text verbatim — preserves whitespace, key
+order, and even duplicate keys (last-one-wins only at query time, not at
+storage time). Every read re-parses the text. Cheap to write, more
+expensive to query.
+
+`jsonb` parses on write into a decomposed binary tree structure — object
+keys are DEDUPED (keeping the last value for a repeated key), keys within
+an object are stored in a sorted order for fast lookup, and whitespace is
+gone. Slightly more expensive to write (it has to parse and rebuild), but
+dramatically cheaper to query, and — critically — it's the only one of the
+two that supports GIN indexing. In practice you almost always want jsonb;
+plain `json` is really for the narrow case where you must preserve the
+exact original document byte-for-byte (e.g., an audit log of raw payloads).
+
+--------------------------------------------------------------------------------
+6.2  Indexing jsonb — GIN and the two operator classes
+--------------------------------------------------------------------------------
+A GIN (Generalized Inverted Index) on a jsonb column indexes every key and
+value inside the document, so containment/existence queries don't require a
+full table scan:
+
+    CREATE INDEX ON sandbox.users USING GIN (metadata);
+
+    -- containment: does metadata contain this fragment?
+    SELECT * FROM sandbox.users WHERE metadata @> '{"plan": "enterprise"}';
+
+    -- key existence
+    SELECT * FROM sandbox.users WHERE metadata ? 'referral_code';
+
+Default `jsonb_ops` supports both `@>` (containment) and `?`/`?|`/`?&`
+(existence) operators but produces a larger index. `jsonb_path_ops`
+produces a notably smaller, faster index specifically for `@>` containment
+queries, at the cost of NOT supporting the existence operators at all —
+choose it when you know containment is the only access pattern you need:
+
+    CREATE INDEX ON sandbox.users USING GIN (metadata jsonb_path_ops);
+
+--------------------------------------------------------------------------------
+6.3  When jsonb is the right call vs when it's a schema smell
+--------------------------------------------------------------------------------
+JSONB is genuinely the closest thing to "a Mongo document living inside a
+Postgres column" — it's the escape hatch for attributes that are legitimately
+variable per row (custom fields, feature flags, a third-party API payload
+you're passing through). But it is not a substitute for modeling data you
+actually understand the shape of. The query planner cannot use per-column
+statistics, foreign keys, or CHECK constraints on structure buried inside a
+jsonb blob the way it can on real columns — every jsonb field you rely on
+heavily for filtering/joining is optimizer-invisible in a way a normalized
+column isn't. The Week 6 deep dive covers this trade-off properly; for now,
+the rule of thumb is: relational core for anything you query, filter, join,
+or constrain regularly; jsonb for the genuinely-variable long tail.
+
+
+################################################################################
+# 7. APPLIED — sandbox.users, WITH RATIONALE                                 #
+################################################################################
+
+    CREATE TABLE sandbox.users (
+        id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email           text NOT NULL UNIQUE,
+        created_at      timestamptz NOT NULL DEFAULT now(),
+        is_active       boolean NOT NULL DEFAULT true,
+        account_balance numeric(12,2) NOT NULL DEFAULT 0,
+        metadata        jsonb NOT NULL DEFAULT '{}'::jsonb
+    );
+
+Rationale, column by column:
+
+  id              -- sequential identity: this is a single-writer learning
+                     table, not a distributed system needing client-side ID
+                     generation, so the index-locality win of a sequential
+                     key beats UUID's coordination-free benefit here.
+
+  email           -- text, not varchar(n): no real length business rule,
+                     and text/varchar perform identically anyway. UNIQUE
+                     because this is the actual business constraint we care
+                     about (no two users share an email) — the thing worth
+                     enforcing at the DB layer, unlike an arbitrary length
+                     cap.
+
+  created_at      -- timestamptz: this is an event (row creation) that must
+                     mean the same real-world instant no matter which
+                     timezone reads it back later.
+
+  is_active       -- boolean NOT NULL: explicitly closing off the 3rd
+                     (NULL) state, since "unknown whether active" isn't a
+                     meaningful business state here — force a real decision
+                     at insert time via the DEFAULT.
+
+  account_balance -- numeric(12,2): this is money. Exactness is
+                     non-negotiable; 12,2 supports up to 9,999,999,999.99,
+                     comfortably beyond any plausible individual balance.
+
+  metadata        -- jsonb: the deliberately-variable bucket for whatever
+                     attributes don't deserve a first-class column yet —
+                     exactly the Mongo-document-shaped part of this schema.
+
+
+################################################################################
+# 8. SELF-CHECK — you should be able to answer these without looking back    #
+################################################################################
+
+  1. Why does `text` outperform `varchar(n)` in exactly zero real scenarios
+     in Postgres, when many other databases reward you for the length cap?
+
+  2. Walk through, step by step, what physically happens when you insert a
+     50KB jsonb document into a table — from parse to TOAST.
+
+  3. A colleague says "let's use timestamp instead of timestamptz, we'll
+     just make sure all our servers run in UTC." What's still wrong with
+     this plan?
+
+  4. Why do sequential bigint primary keys typically outperform random
+     UUIDv4 primary keys on write-heavy tables at scale, concretely in
+     terms of what happens at the B-tree index level?
+
+  5. You need exact-money arithmetic AND you're aggregating millions of
+     rows nightly and performance is a genuine concern. Numeric is exact
+     but slow. What are you actually trading off, and is there a
+     legitimate reason to still choose numeric anyway? (Hint: think about
+     what "slow" costs you vs. what a reconciliation error costs you.)
+
+
+################################################################################
+# 9. CHEAT SHEET — SESSION 2 IN ONE PAGE                                     #
+################################################################################
+
+--------------------------------------------------------------------------------
+TYPE SELECTION — THE DECISIONS THAT ACTUALLY MATTER
+--------------------------------------------------------------------------------
+  Money / exact decimal .......... numeric(p,s)      NEVER float
+  Scientific / tolerable error ... double precision
+  Any string ..................... text              (varchar only for a real
+                                                      business length rule)
+  Fixed-length string ............ don't. char(n) is a legacy trap.
+  Event timestamp ................ timestamptz       NOT timestamp
+  Naive wall-clock (rare) ........ timestamp
+  Duration ....................... interval          (calendar-aware, 3 fields)
+  True/false ..................... boolean NOT NULL  (else it's 3 states)
+  Surrogate PK, single writer .... bigint GENERATED ALWAYS AS IDENTITY
+  Surrogate PK, distributed ...... uuid  (prefer UUIDv7 over v4 for locality)
+  Variable/unknown attributes .... jsonb             NEVER json for querying
+
+--------------------------------------------------------------------------------
+THE NUMBERS
+--------------------------------------------------------------------------------
+  smallint 2B   integer 4B   bigint 8B   boolean 1B
+  timestamp / timestamptz / date-time    8B (µs since 2000-01-01)
+  date 4B       uuid 16B
+  numeric       VARIABLE — cost scales with digit count
+  text/jsonb    VARIABLE — 1-byte header when small, 4-byte when larger
+  Page size     8KB;  TOAST threshold ~2KB;  a row cannot span pages
+
+--------------------------------------------------------------------------------
+THE FIVE THINGS PEOPLE GET WRONG
+--------------------------------------------------------------------------------
+  1. float for money        -> silent drift, caught later by reconciliation
+  2. timestamp for events   -> ambiguous instants across timezones
+  3. varchar(n) "for speed" -> zero performance benefit over text in PG
+  4. random UUIDv4 PK       -> index page splits, bloat, cold-cache writes
+  5. jsonb as the schema    -> optimizer-blind: no stats, no FKs, no CHECKs
+
+--------------------------------------------------------------------------------
+MECHANISMS TO BE ABLE TO EXPLAIN OUT LOUD
+--------------------------------------------------------------------------------
+  serial      Not a type. Sugar for: sequence + DEFAULT nextval() + ownership.
+              Sequences are non-transactional by design -> GAPS ARE NORMAL and
+              are not a bug. Prefer GENERATED ALWAYS AS IDENTITY in new schemas.
+
+  varlena     Universal variable-length layout: length header + payload.
+              1-byte header when small, 4-byte when larger.
+
+  TOAST       Value too big for the page -> compress inline -> if still too
+              big, move out-of-line to a TOAST table, leave a pointer.
+              Cost: an extra fetch on every query that touches the column.
+
+  timestamptz Stores UTC. Converts IN on write and OUT on read using the
+              session TimeZone. Does NOT store a per-row timezone.
+
+  numeric     Exact base-10 arithmetic in software, not a CPU instruction.
+              Exact but slower than native float math. Worth it for money.
+
+  jsonb vs    jsonb: parsed on write, keys deduped + sorted, GIN-indexable.
+  json        json: raw text preserved verbatim, re-parsed every read.
+
+  GIN opclass jsonb_ops      -> supports @> and ? / ?| / ?&, larger index
+              jsonb_path_ops -> @> only, smaller and faster
+
+--------------------------------------------------------------------------------
+COMMANDS TO KEEP AT HAND
+--------------------------------------------------------------------------------
+  pg_column_size(val)              on-disk bytes incl. header + compression
+  pg_typeof(expr)                  what type did this expression resolve to
+  pg_size_pretty(pg_total_relation_size('t'))   table + indexes + TOAST
+  \d+ tablename                    columns INCLUDING per-column storage mode
+  \dTS                             list system types (int4, bpchar, ...)
+  psql -E                          echo the catalog SQL behind \d commands
+
+--------------------------------------------------------------------------------
+THE REFERENCE IMPLEMENTATION
+--------------------------------------------------------------------------------
+    CREATE TABLE sandbox.users (
+        id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email           text NOT NULL UNIQUE,
+        created_at      timestamptz NOT NULL DEFAULT now(),
+        is_active       boolean NOT NULL DEFAULT true,
+        account_balance numeric(12,2) NOT NULL DEFAULT 0,
+        metadata        jsonb NOT NULL DEFAULT '{}'::jsonb
+    );
+
+--------------------------------------------------------------------------------
+ONE-LINE TAKEAWAY
+--------------------------------------------------------------------------------
+  A type in Postgres is not a label — it determines row size, index size,
+  write amplification, and what the planner can PROVE about your data.
+  Choose it deliberately, per column, every time.
+
+
+################################################################################
+# ADDENDUM — READING POSTGRES ERRORS: A TAXONOMY                             #
+################################################################################
+
+Written after the hands-on, because the first "wrong value" test hit an
+error from a completely different subsystem than intended — which is itself
+the most useful thing in this section.
+
+--------------------------------------------------------------------------------
+A.1  THE QUOTING TRAP — WHY "1500" IS NOT A STRING
+--------------------------------------------------------------------------------
+    INSERT INTO sandbox.users (email, account_balance, metadata) VALUES
+    ('jane.smith@example.com', "1500", '{"department":"Marketing"}'::jsonb);
+
+    ERROR:  column "1500" does not exist
+
+This is NOT a type error. The table's typing was never consulted. In SQL:
+
+    '...'   SINGLE quotes  -> a string LITERAL (a value)
+    "..."   DOUBLE quotes  -> an IDENTIFIER (a table/column/schema name)
+
+So `"1500"` made the parser go looking for a COLUMN named 1500. The failure
+happened during name resolution, long before any type checking.
+
+Double quotes also PRESERVE CASE, which is the other half of this trap:
+
+    CREATE TABLE MyTable (...)      -- folds to  mytable
+    CREATE TABLE "MyTable" (...)    -- stays     MyTable  (a DIFFERENT object)
+
+Unquoted identifiers are folded to lower case by Postgres (the SQL standard
+says fold to UPPER — Postgres deliberately differs). Once you quote an
+identifier with a capital in it, you must quote it forever. This is why
+"why does my ORM-generated table need quotes everywhere" is a recurring
+support question. Rule: never quote identifiers, and never use capitals in
+object names.
+
+--------------------------------------------------------------------------------
+A.2  THE SUBTLE PART — SINGLE QUOTES WOULD HAVE *SUCCEEDED*
+--------------------------------------------------------------------------------
+    INSERT INTO sandbox.users (email, account_balance)
+    VALUES ('a@b.com', '1500');     -- SUCCEEDS. Inserts 1500.00
+
+A quoted literal in Postgres does not start out as `text`. It starts as type
+`unknown`, and the parser coerces it to whatever the target context requires.
+`'1500'` -> numeric is a legal, silent, successful coercion.
+
+THE LESSON: string-quoting a number is not automatically an error. If you
+assume the type system rejects it, you will misjudge what your schema
+actually protects you from. Types catch UNPARSEABLE values, not
+badly-quoted ones.
+
+--------------------------------------------------------------------------------
+A.3  THE FIVE ERROR CLASSES — EACH FAILS IN A DIFFERENT SUBSYSTEM
+--------------------------------------------------------------------------------
+
+  1. COERCION FAILURE — unknown literal, no valid parse into the target type
+        INSERT INTO sandbox.users (email, account_balance)
+        VALUES ('a@b.com', 'fifteen hundred');
+        ERROR:  invalid input syntax for type numeric: "fifteen hundred"
+        SQLSTATE 22P02 (invalid_text_representation)
+        -> failed in the type's INPUT FUNCTION (typinput from pg_type)
+
+  2. TRUE TYPE MISMATCH — no coercion path exists at all
+        INSERT INTO sandbox.users (email, account_balance)
+        VALUES ('a@b.com', true);
+        ERROR:  column "account_balance" is of type numeric but expression
+                is of type boolean
+        SQLSTATE 42804 (datatype_mismatch)
+        -> failed in the PARSER/ANALYZER, before execution
+
+  3. UNIQUE VIOLATION — constraint enforced by the backing index
+        INSERT INTO sandbox.users (email) VALUES ('john.doe@example.com');
+        ERROR:  duplicate key value violates unique constraint
+                "users_email_key"
+        SQLSTATE 23505 (unique_violation)
+        -> failed at INDEX INSERT time, i.e. during execution
+
+  4. NOT NULL VIOLATION — checked on the tuple itself
+        INSERT INTO sandbox.users (email) VALUES (NULL);
+        ERROR:  null value in column "email" of relation "users" violates
+                not-null constraint
+        SQLSTATE 23502 (not_null_violation)
+
+  5. IDENTITY OVERRIDE — GENERATED ALWAYS earning its keep
+        INSERT INTO sandbox.users (id, email) VALUES (999, 'x@y.com');
+        ERROR:  cannot insert a non-DEFAULT value into column "id"
+        SQLSTATE 428C9 (generated_always)
+        -> This is the concrete, observable difference between
+           GENERATED ALWAYS AS IDENTITY and serial / GENERATED BY DEFAULT.
+           serial would have silently accepted 999 — and left the sequence
+           still pointing at 1, so a future insert eventually collides with
+           it. GENERATED ALWAYS closes that hole by refusing outright.
+           Force it only when you mean it:
+               INSERT INTO sandbox.users (id, email)
+               OVERRIDING SYSTEM VALUE VALUES (999, 'x@y.com');
+
+--------------------------------------------------------------------------------
+A.4  SQLSTATE — WHAT APPLICATION CODE SHOULD ACTUALLY BRANCH ON
+--------------------------------------------------------------------------------
+Every Postgres error carries a five-character SQLSTATE code. Message TEXT is
+localized (changes with lc_messages) and is reworded between versions.
+SQLSTATE is stable and standardized. Application error handling MUST branch
+on the code, never on string-matching the message.
+
+    Class 22  — Data Exception
+        22P02  invalid_text_representation   (bad input syntax)
+        22003  numeric_value_out_of_range
+        22001  string_data_right_truncation  (varchar(n) overflow)
+
+    Class 23  — Integrity Constraint Violation
+        23502  not_null_violation
+        23503  foreign_key_violation
+        23505  unique_violation
+        23514  check_violation
+
+    Class 42  — Syntax Error or Access Rule Violation
+        42703  undefined_column      <- the "1500" error above
+        42P01  undefined_table
+        42804  datatype_mismatch
+        42601  syntax_error
+
+    Class 40  — Transaction Rollback
+        40001  serialization_failure  (retry the transaction — Week 9)
+        40P01  deadlock_detected      (retry the transaction — Week 9)
+
+23505 in particular is the one real applications catch deliberately: it is
+how you implement "insert if not exists" race-safely without a pre-check
+SELECT (which has a TOCTOU window). Classes 40001 and 40P01 are the two you
+must build automatic retry around — they are expected, not exceptional.
+
+Turn on full error detail in psql to see SQLSTATE, constraint name, and
+schema/table/column context on every error:
+
+    \set VERBOSITY verbose
+
+--------------------------------------------------------------------------------
+ADDENDUM CHEAT SHEET
+--------------------------------------------------------------------------------
+  'single'  = value        "double" = identifier (and case-preserving)
+  '1500' -> numeric SUCCEEDS (unknown-type literal coercion)
+  Unquoted identifiers fold to LOWER case in Postgres
+  Branch application code on SQLSTATE, never on message text
+  23505 unique · 23502 not-null · 23503 FK · 22P02 bad syntax · 42703 no column
+  40001 / 40P01 -> retry the transaction, these are expected
+  \set VERBOSITY verbose  -> full error detail in psql
+
+
+--------------------------------------------------------------------------------
+SESSION 2 COMPLETE. NEXT: Session 3 — DDL, schema evolution, and keys.
+See session3_ddl_deepdive.txt
+--------------------------------------------------------------------------------

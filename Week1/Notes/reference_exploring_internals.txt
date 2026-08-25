@@ -1,0 +1,397 @@
+################################################################################
+#                                                                              #
+#   REFERENCE — HOW TO LOOK UP POSTGRES INTERNALS YOURSELF                    #
+#   Cross-week reference (filed under Week 1, used throughout the program)     #
+#   PGQL(R): MongoDB -> PostgreSQL Mastery Program                            #
+#                                                                              #
+################################################################################
+
+WHY THIS DOCUMENT EXISTS
+--------------------------------------------------------------------------------
+The Session 2 notes used terms like `pg_type`, `varlena`, and TOAST without
+saying where they live. They live in three different PLACES, and knowing
+which place a given term belongs to is most of the skill:
+
+    1. SQL-VISIBLE      — system catalogs and functions you can query right
+                          now, in your own database, as data.
+    2. DOCUMENTED       — concepts explained in prose in the official docs,
+                          with no single object to query.
+    3. SOURCE-ONLY      — C structs and macros that exist only in the
+                          Postgres source tree, observable from SQL only by
+                          their side effects.
+
+`pg_type` is (1). TOAST is (2) with strong (1) support. `varlena` is (3)
+with observable side effects via (1). Below: how to reach each.
+
+
+################################################################################
+# 1. THE SYSTEM CATALOGS — POSTGRES DESCRIBING ITSELF                        #
+################################################################################
+
+Every Postgres database contains a schema called `pg_catalog` holding real
+tables that describe every object in that database. This is not a special
+API — they are ordinary tables you can SELECT from, JOIN, and (carefully)
+even read execution plans for. The entire `\d` family of psql commands is
+just pre-written queries against these.
+
+--------------------------------------------------------------------------------
+1.1  pg_type — one row per data type
+--------------------------------------------------------------------------------
+
+    SELECT typname, typlen, typalign, typstorage, typcategory
+    FROM pg_type
+    WHERE typname IN ('int2','int4','int8','numeric','text','varchar',
+                      'bpchar','bool','timestamp','timestamptz','uuid',
+                      'json','jsonb')
+    ORDER BY typcategory, typname;
+
+FIRST SURPRISE: the internal names are not the SQL names.
+
+    int2        = smallint
+    int4        = integer
+    int8        = bigint
+    bpchar      = char(n)        ("blank-padded character")
+    varchar     = varchar(n)
+    float4      = real
+    float8      = double precision
+
+The SQL-standard spellings are aliases resolved by the parser. When you read
+Postgres error messages, EXPLAIN output, or source code, you will see the
+internal names — recognizing them is not optional.
+
+DECODING THE COLUMNS THAT MATTER:
+
+  typlen      Storage length in bytes.
+                > 0   fixed-width (int4 = 4, timestamptz = 8, uuid = 16)
+                 -1   VARIABLE-LENGTH — this is a varlena (text, numeric,
+                      jsonb, arrays, bytea...)
+                 -2   null-terminated C string (internal use)
+
+  typalign    Alignment boundary the value must start on in a tuple:
+                'c'   char    — 1 byte, no alignment
+                's'   short   — 2 bytes
+                'i'   int     — 4 bytes
+                'd'   double  — 8 bytes
+              This is the mechanism behind column-ordering affecting row
+              size: a 1-byte bool followed by an 8-byte bigint wastes up to
+              7 bytes of padding that reordering would reclaim.
+
+  typstorage  TOAST strategy — what happens when the value is large:
+                'p'   plain     — never compressed, never moved out-of-line
+                                  (fixed-width types)
+                'm'   main      — compress inline, avoid moving out
+                'e'   external  — move out-of-line, do NOT compress
+                'x'   extended  — compress first, then move out-of-line if
+                                  still too big (the default for text/jsonb)
+
+  typcategory A grouping letter used for implicit-cast resolution:
+                'N' numeric, 'S' string, 'D' date/time, 'B' boolean,
+                'A' array, 'U' user-defined/other
+
+  typinput /  The C functions that parse text input into the internal
+  typoutput   representation and render it back out. This pair is what you
+              implement when you define a genuinely new type.
+
+--------------------------------------------------------------------------------
+1.2  The other catalogs worth knowing by name
+--------------------------------------------------------------------------------
+
+  pg_class        One row per table, index, view, sequence, matview.
+                  Key columns: relpages (size in 8KB pages), reltuples
+                  (estimated row count — planner input, updated by ANALYZE),
+                  reltoastrelid (the OID of this table's TOAST table, 0 if
+                  none), relkind ('r' table, 'i' index, 'v' view, 'm'
+                  matview, 'p' partitioned table).
+
+  pg_attribute    One row per COLUMN of every relation. attlen / attalign /
+                  attstorage mirror the pg_type values but can be overridden
+                  per-column (e.g. ALTER TABLE ... SET STORAGE EXTERNAL).
+                  attnum is the column position; negative attnums are system
+                  columns (ctid, xmin, xmax...).
+
+  pg_stats        A VIEW (not a table) over pg_statistic, holding the
+                  planner's per-column statistics: n_distinct,
+                  most_common_vals, most_common_freqs, histogram_bounds,
+                  correlation. This is what ANALYZE populates and what the
+                  planner reasons over. Week 10 lives here.
+
+  pg_index        Index definitions — indkey (which columns), indisunique,
+                  indpred (the WHERE clause of a partial index), indexprs
+                  (expression-index expressions).
+
+  pg_am           Access methods: btree, hash, gin, gist, spgist, brin.
+
+  pg_opclass      Operator classes — this is where `jsonb_ops` vs
+                  `jsonb_path_ops` from the Session 2 notes actually live.
+
+  pg_proc         Every function. pg_namespace: every schema.
+                  pg_constraint: every CHECK/FK/UNIQUE/PK constraint.
+
+--------------------------------------------------------------------------------
+1.3  THE SINGLE BEST TRICK: psql -E
+--------------------------------------------------------------------------------
+Start psql with the -E flag and it ECHOES the SQL behind every backslash
+command before running it:
+
+    psql -E -U ronitroy -d pagila
+
+    \d film
+
+You will see the full catalog query psql fires against pg_class,
+pg_attribute, pg_type, pg_constraint, etc. This is the fastest possible way
+to learn the catalogs — you are reading queries written by the people who
+designed them, against your own data.
+
+Related psql introspection:
+    \dT              list data types in the current database
+    \dT+             ...with size, description, and internal detail
+    \dTS             include SYSTEM types (this is where you see int4 etc.)
+    \dt / \di / \dv  tables / indexes / views
+    \d+ tablename    table detail INCLUDING per-column storage strategy
+    \df             functions
+    \dx             installed extensions
+
+
+################################################################################
+# 2. VARLENA — SOURCE-ONLY, BUT OBSERVABLE FROM SQL                          #
+################################################################################
+
+--------------------------------------------------------------------------------
+2.1  What it is and where the code lives
+--------------------------------------------------------------------------------
+"varlena" = VARiable LENgth Array. It is the universal in-memory/on-disk
+layout for every variable-length Postgres value: a length header followed by
+the payload bytes. It is a C struct, NOT a SQL object — there is nothing to
+SELECT.
+
+    struct varlena          src/include/c.h
+    access macros           src/include/postgres.h
+                            (VARSIZE, VARDATA, VARATT_IS_SHORT,
+                             VARATT_IS_COMPRESSED, VARATT_IS_EXTERNAL...)
+
+The header is either 4 bytes or — for values small enough — a compact 1-byte
+"short varlena" header, which is why a one-character text value does not
+cost you 4 bytes of overhead.
+
+TOAST (The Oversized-Attribute Storage Technique) machinery:
+
+    src/backend/access/common/detoast.c
+    src/backend/access/common/toast_internals.c
+    src/backend/access/heap/heaptoast.c
+
+(Historically this was all one file, src/backend/access/heap/tuptoaster.c,
+split up in PG13. Older blog posts and books will reference that name.)
+
+--------------------------------------------------------------------------------
+2.2  Observing varlena behavior WITHOUT reading C
+--------------------------------------------------------------------------------
+`pg_column_size(anyvalue)` returns the number of bytes the value occupies on
+disk, INCLUDING its varlena header and any compression. This makes the whole
+mechanism directly measurable.
+
+WATCH THE HEADER SWITCH FROM 1 BYTE TO 4:
+
+    SELECT pg_column_size(''::text)              AS empty,
+           pg_column_size('a'::text)             AS one_char,
+           pg_column_size(repeat('a',126)::text) AS at_126,
+           pg_column_size(repeat('a',127)::text) AS at_127;
+
+Run it. Somewhere in that range the cost jumps by more than the one byte of
+added data — that is the short header giving way to the full 4-byte header.
+Find the exact boundary yourself; that is the exercise.
+
+WATCH COMPRESSION HAPPEN:
+
+    -- highly repetitive: compresses enormously
+    SELECT pg_column_size(repeat('a', 10000)::text) AS compressible;
+
+    -- effectively random: barely compresses at all
+    SELECT pg_column_size(
+             (SELECT string_agg(md5(g::text), '')
+              FROM generate_series(1,300) g)::text
+           ) AS incompressible;
+
+Same logical length, wildly different storage cost. This is TOAST's inline
+compression step, and it is why "how big is my table" cannot be answered
+from row counts and column types alone.
+
+COMPARE FIXED-WIDTH VS VARLENA OVERHEAD:
+
+    SELECT pg_column_size(1::int)          AS int4,
+           pg_column_size(1::bigint)       AS int8,
+           pg_column_size(1::numeric)      AS numeric_1,
+           pg_column_size(123456789.12::numeric) AS numeric_big,
+           pg_column_size(now())           AS timestamptz,
+           pg_column_size(gen_random_uuid()) AS uuid;
+
+Note numeric is variable-length — its cost scales with how many digits you
+actually store, unlike the fixed 8 bytes of a bigint or timestamptz. That is
+part of the "numeric is slower" trade-off from the Session 2 notes made
+concrete.
+
+--------------------------------------------------------------------------------
+2.3  Finding a table's TOAST table
+--------------------------------------------------------------------------------
+    SELECT c.relname            AS table_name,
+           t.relname            AS toast_table,
+           pg_size_pretty(pg_relation_size(c.oid))  AS main_size,
+           pg_size_pretty(pg_relation_size(t.oid))  AS toast_size
+    FROM pg_class c
+    LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+    WHERE c.relname = 'users';
+
+If toast_size is non-trivial, values from that table are physically living
+outside the main heap — every query touching those columns pays an extra
+fetch.
+
+Size functions worth memorizing:
+    pg_relation_size()        just the main fork, no indexes, no TOAST
+    pg_table_size()           main + TOAST + free space map
+    pg_total_relation_size()  everything, INCLUDING indexes
+    pg_size_pretty()          wrap any of the above for human output
+
+
+################################################################################
+# 3. PAGEINSPECT — READING RAW BYTES OFF THE PAGE                            #
+################################################################################
+
+The real tool for this level of investigation. Contrib extension, ships with
+Postgres, requires superuser.
+
+    CREATE EXTENSION IF NOT EXISTS pageinspect;
+
+    -- the page header of page 0
+    SELECT * FROM page_header(get_raw_page('sandbox.users', 0));
+
+    -- every line pointer and tuple on that page
+    SELECT lp,            -- line pointer (item id) within the page
+           lp_off,        -- byte offset of the tuple within the 8KB page
+           lp_len,        -- tuple length
+           t_xmin,        -- inserting transaction id
+           t_xmax,        -- deleting transaction id (0 = live)
+           t_ctid         -- physical row pointer (page, item)
+    FROM heap_page_items(get_raw_page('sandbox.users', 0));
+
+    -- B-tree index internals
+    SELECT * FROM bt_metap('users_pkey');
+    SELECT * FROM bt_page_stats('users_pkey', 1);
+
+This is how you SEE MVCC rather than take it on faith: UPDATE a row, then
+re-run heap_page_items and watch a second tuple version appear with the old
+one's t_xmax now set. Week 9 (MVCC) and Week 11 (VACUUM/bloat) both become
+concrete here instead of theoretical.
+
+Companion extensions for later weeks:
+    pgstattuple     — real bloat / dead-tuple measurement (Week 11)
+    pg_visibility   — visibility map state, why VACUUM did or didn't help
+    pg_buffercache  — what is actually resident in shared_buffers
+    pg_stat_statements — normalized query workload stats (Week 11)
+
+
+################################################################################
+# 4. THE DOCUMENTATION MAP — WHICH CHAPTERS ACTUALLY MATTER                  #
+################################################################################
+
+Use /current/ URLs; they track the latest stable release. Swap /current/ for
+a version number (e.g. /16/) when you need version-specific behavior.
+
+  Data Types
+      postgresql.org/docs/current/datatype.html
+      The per-type reference. Read the numeric and date/time sections in
+      full at least once.
+
+  System Catalogs
+      postgresql.org/docs/current/catalogs.html
+      One page per catalog, every column documented. pg_type is at
+      .../catalog-pg-type.html
+
+  Database Physical Storage
+      postgresql.org/docs/current/storage.html
+      THE chapter for this material. Covers on-disk file layout, page
+      layout, TOAST (.../storage-toast.html), the visibility map, and the
+      free space map. If you read one chapter to make Session 2 click, this
+      is it.
+
+  Indexes
+      postgresql.org/docs/current/indexes.html
+      Index types, multicolumn ordering, partial and expression indexes,
+      index-only scans. Week 8 material, worth skimming early.
+
+  Performance Tips
+      postgresql.org/docs/current/performance-tips.html
+      EXPLAIN, planner statistics, controlling the planner. Week 10.
+
+  Internals (Part VII)
+      postgresql.org/docs/current/internals.html
+      Planner/optimizer overview, system catalog declarations, index access
+      method interfaces, page layout formal spec.
+
+
+################################################################################
+# 5. READING THE SOURCE WHEN THE DOCS RUN OUT                                #
+################################################################################
+
+  doxygen.postgresql.org
+      Cross-referenced browsable source. Search a struct or function name
+      (e.g. "varlena", "heap_insert", "toast_compress_datum") and get the
+      definition plus every caller and callee. Far better than grepping
+      GitHub for this purpose.
+
+  github.com/postgres/postgres
+      The mirror. Useful for git blame and commit messages — Postgres commit
+      messages are unusually well written and often explain WHY a design
+      choice was made.
+
+  README FILES IN THE SOURCE TREE
+      These are hand-written design documents, not generated, and several
+      are genuinely better than any external blog post:
+
+        src/backend/access/nbtree/README     B-tree implementation — the
+                                             real explanation of page
+                                             splits and index locality
+                                             (relevant to the UUID-vs-serial
+                                             trade-off in Session 2)
+        src/backend/access/heap/README.HOT   Heap-Only Tuples: the
+                                             optimization that avoids index
+                                             writes on some UPDATEs
+        src/backend/optimizer/README         Planner architecture
+        src/backend/storage/buffer/README    Buffer manager / shared_buffers
+
+  pgsql-hackers mailing list archives
+      postgresql.org/list/pgsql-hackers/
+      Where features are designed in public. Searching here for a feature
+      name usually surfaces the full design debate.
+
+
+################################################################################
+# 6. EXERCISES — DO THESE, THEY TAKE 20 MINUTES TOTAL                        #
+################################################################################
+
+  1. Run `psql -E` against pagila and execute `\d film`. Read the catalog
+     queries it echoes. Identify which catalogs it joins and why each one is
+     needed to render that output.
+
+  2. Query pg_type for every type used in the Pagila schema. Which ones are
+     varlena (typlen = -1)? Which have typstorage = 'x'? Does that match
+     your intuition about which columns could get large?
+
+  3. Find the exact byte length at which a text value's varlena header grows
+     from 1 byte to 4, using pg_column_size and repeat().
+
+  4. Create sandbox.users, insert one row, then use pageinspect's
+     heap_page_items to look at the raw tuple. Identify t_xmin. Then UPDATE
+     the row and re-run it — explain what you now see and why there are two
+     tuples for one logical row.
+
+  5. Find a Pagila table with a TOAST table (query pg_class.reltoastrelid).
+     Which column is responsible? Verify with pg_column_size on the widest
+     values in it.
+
+
+--------------------------------------------------------------------------------
+RULE OF THUMB FOR THE REST OF THIS PROGRAM: if a term appears in these notes
+and you cannot immediately say whether it is a catalog you can query, a
+concept in the docs, or a C struct in the source, that is the signal to stop
+and locate it using this document. Knowing WHERE a thing lives is most of
+knowing what it is.
+--------------------------------------------------------------------------------
