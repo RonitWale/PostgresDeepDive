@@ -722,8 +722,8 @@ ONE-LINE TAKEAWAY
   harmless; a rewrite under the same lock is an outage.
 
 
---------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
 NEXT: Session 4 — Milestone. Map the Pagila schema by hand using only \d,
 write 10 plain-English questions of the data, and draft your own
 Mongo->Postgres bridge notes. Then the Week 1 self-check.
---------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
