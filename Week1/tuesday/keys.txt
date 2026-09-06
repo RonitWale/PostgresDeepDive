@@ -1,0 +1,6 @@
+why WHERE col <> 5 drops NULL rows but CHECK (col <> 5) accepts them?
+=> WHERE is a clause which is responsible to evalutae all theree TRUE , FALSE and UNKNOWN attribute in 
+sql. so when we write col != 5 this strictly drops any unknown value and in sql either values that not 5 or null are strictly be filteredas null in postgres is treated as unknown 
+
+whereas CHECK is aconstrant which is typically enforce any values except the one it is checking its constraint not a filter 
+hence it accepts happily null value as TRUE 

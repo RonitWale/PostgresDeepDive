@@ -1,0 +1,43 @@
+1. Why a result set has no order unless you ask for one ? 
+=> Because postgress does not just reorder after every updte because sorting takes a whole database scanning which is costly , what sql does is when it modify something it fees up that space ,vaccum it and take up some space elsewhere untill we dont want thing in ORDER BY it will just send the data the way it saved it.
+2. why SQL keeps duplicates when the model forbids them ?
+=> SQL keeps duplicate because sql is not a set but a bag , it holds everything not things that requires once , for an example there are lakhs of citis in world but crores of human beings , which if unique will have an error in aggregation , counting operations.
+3. what a join is in terms of × and σ.
+=> cartesian product and selection means you try to find out relation between two bags by some common identity and then want to capture every proper details of that individual identity.
+
+
+
+1. No order unless you ask — 2/3.
+
+The mechanism is right and you clearly ran the demo: an UPDATE writes the new version elsewhere, the old slot is freed and reused after vacuum, and a seq scan hands rows back in physical order. That's the concrete half and most people don't have it.
+
+What's missing is that you answered how you observe it rather than why it's true. The reason is upstream of Postgres entirely: a relation is a set of tuples, and a set has no order. There is no ordering to preserve, so nothing is being "not reordered to save cost." The heap and the vacuum story explain why the illusion of insertion order breaks — they aren't the justification.
+
+Two wording problems an interviewer will hear: sorting scans the table, not "the whole database"; and vacuum is a Postgres implementation detail, not something "SQL does." Keep the three layers separate when you speak — the model (sets, no order), the SQL standard (ORDER BY is the only guarantee), the engine (heap, MVCC, vacuum). You're currently collapsing them into one.
+
+Also missing the practical edge: physical order also moves for reasons unrelated to UPDATE — index scans, bitmap scans, parallel workers, a plan change. And the guarantee only attaches to the outermost ORDER BY, and only bites if it's a total order (add a unique tiebreaker).
+
+Say it like this: "A relation is a set of tuples, so order isn't part of the model — there's nothing to preserve. Physically Postgres stores rows in an unordered heap and a seq scan returns them in whatever order they sit, which shifts as soon as an UPDATE writes a new version elsewhere and vacuum recycles the space. Index scans, bitmap scans and parallel workers change it too. So the only guarantee is an ORDER BY on the outermost query, and it needs a unique tiebreaker to be stable."
+
+2. Bags not sets — 2/3, but the opening is circular.
+
+"SQL keeps duplicates because SQL is a bag" is the same sentence twice. An interviewer will read that as a memorised label rather than an understanding, and will push.
+
+Your example, though, is the right argument and you got there yourself: project city from a person table, dedup it, and now the count doesn't match the number of people. That's silent row loss — the answer, badly dressed.
+
+The half you're missing is the cost argument, which is actually the primary one: deduplication requires a sort or a hash over the entire result. Making every projection dedup by default would tax every query in the system to serve the minority that want it. So SQL inverts it — duplicates are free, dedup is opt-in and you pay: DISTINCT, UNION, INTERSECT, EXCEPT. Which is where the habit comes from: default to UNION ALL, and reach for UNION only when you actually need the dedup.
+
+Say it like this: "Two reasons. Dedup costs a sort or a hash over the whole result, so making it implicit would tax every query. And silent row loss is worse than duplicates — if SELECT city FROM person returned each city once, the count wouldn't match the people and every aggregate would be quietly wrong. So SQL uses bags and makes dedup something you ask for and pay for."
+
+3. Join in terms of × and σ — 1/3. This one needs redoing.
+
+You described what a join is for, not what it is. The question asks for the two operators, and the answer is a formula:
+
+A ⋈ₚ B ≡ σₚ(A × B) — pair every tuple of A with every tuple of B, then keep the pairs where predicate p holds.
+
+Two things to say immediately after, because they're what the question is really testing:
+
+It's semantics, not execution. No engine ever materialises the product — nested loop, hash and merge joins all avoid it. The equivalence defines what the answer is; the planner picks how.
+It explains two behaviours you'd otherwise find mysterious. Omit the predicate and you get a row explosion rather than an error — you asked for σ with a predicate of TRUE. And a fan-out inflates a SUM because the product genuinely does contain that many pairs; the arithmetic is correct, your grain is wrong.
+
+One more correction: "some common identity" is too narrow. That's an equi-join specifically. A join predicate can be any predicate — ON a.ts BETWEEN b.start AND b.end is a join with no common identity anywhere in it.
